@@ -2,7 +2,7 @@
 CFPS household consumption dynamics model comparison
 - Training period: 2010-2016 (med / eec)
 - Forecast period: 2018, 2020, 2022
-- Models: random walk, jump diffusion, mean reversion
+- Models: random walk, jump diffusion (symmetric & asymmetric), mean reversion
 - Evaluation: aggregate forecast errors across 192 households and compare total RMSE
 - Runs separately for med, eec, and combined (med + eec)
 """
@@ -25,9 +25,12 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 TRAIN_YEARS = [2010, 2012, 2014, 2016]
 TEST_YEARS = [2018, 2020, 2022]
 ALL_YEARS = TRAIN_YEARS + TEST_YEARS
-CONSUMPTION_COLS = ["med", "eec"]  # med: medical; eec: culture & entertainment expenditure (文娱支出)
+CONSUMPTION_COLS = ["med", "eec"]  # med: medical expenditure; eec: culture & entertainment expenditure
 DT = 2  # CFPS is biennial; consecutive observations are 2 years apart
-JUMP_SIGMA_THRESHOLD = 2.0  # jump detection threshold (multiples of standard deviation)
+
+# Jump detection thresholds for two specifications
+JUMP_SIGMA_THRESHOLD_SYMMETRIC = 2.0   # symmetric jumps: 2 standard deviations
+JUMP_SIGMA_THRESHOLD_ASYMMETRIC = 1.0  # asymmetric positive jumps: 1 standard deviation
 
 
 @dataclass
@@ -43,7 +46,8 @@ class ForecastResult:
     year: int
     actual: float
     pred_rw: float
-    pred_jump: float
+    pred_jump_sym: float    # symmetric jump prediction
+    pred_jump_asym: float   # asymmetric positive jump prediction
     pred_mr: float
 
 
@@ -109,7 +113,7 @@ def fit_mean_reversion(series: np.ndarray) -> ModelParams:
 
     # delta_x = alpha + beta * x_lag
     beta, alpha = np.polyfit(x_lag, delta_x, 1)
-    kappa = max(-beta / DT, 0.0)  # mean reversion requires kappa >= 0
+    kappa = max(-beta / DT, 0.0)
     theta = alpha / (kappa * DT) if kappa > 1e-8 else float(np.mean(series))
 
     fitted = alpha + beta * x_lag
@@ -119,26 +123,42 @@ def fit_mean_reversion(series: np.ndarray) -> ModelParams:
     return ModelParams("mean_reversion", {"kappa": kappa, "theta": theta, "sigma": sigma})
 
 
-def fit_jump_diffusion(series: np.ndarray) -> ModelParams:
+def fit_jump_diffusion(series: np.ndarray, mode: str = "symmetric") -> ModelParams:
     """
-    Jump diffusion (Merton-type, discrete approximation):
-        dX = mu*dt + sigma*dW + J*dN
-    Estimate the diffusion term from all differences first, then flag unusually
-    large changes as jumps.
+    Jump diffusion (Merton-type, discrete approximation).
+    
+    Parameters:
+        mode: "symmetric" → both positive and negative extreme changes are jumps, threshold 2.0σ
+              "asymmetric" → only positive extreme changes are jumps, threshold 1.0σ
     """
+    # Select threshold based on mode
+    if mode == "symmetric":
+        threshold_sigma = JUMP_SIGMA_THRESHOLD_SYMMETRIC
+    else:
+        threshold_sigma = JUMP_SIGMA_THRESHOLD_ASYMMETRIC
+
+    model_name = f"jump_diffusion_{mode}"
+
     if len(series) < 2:
         last = float(series[-1])
         return ModelParams(
-            "jump_diffusion",
+            model_name,
             {"mu": 0.0, "sigma": 0.0, "lambda": 0.0, "mu_j": 0.0, "sigma_j": 0.0, "last_level": last},
         )
 
     diffs = np.diff(series)
-    mu = float(np.mean(diffs)) / DT  # annualized drift
+    mu = float(np.mean(diffs)) / DT
     sigma = _safe_std(diffs) / np.sqrt(DT) if len(diffs) > 1 else 0.0
 
-    threshold = JUMP_SIGMA_THRESHOLD * sigma * np.sqrt(DT)
-    jump_mask = np.abs(diffs - mu * DT) > threshold if threshold > 0 else np.zeros(len(diffs), dtype=bool)
+    threshold = threshold_sigma * sigma * np.sqrt(DT)
+
+    # Detect jumps based on mode
+    if mode == "symmetric":
+        # Both positive and negative extremes are jumps
+        jump_mask = np.abs(diffs - mu * DT) > threshold if threshold > 0 else np.zeros(len(diffs), dtype=bool)
+    else:
+        # Only positive extreme changes are jumps
+        jump_mask = (diffs - mu * DT) > threshold if threshold > 0 else np.zeros(len(diffs), dtype=bool)
 
     jump_sizes = diffs[jump_mask]
     diff_sizes = diffs[~jump_mask]
@@ -153,7 +173,7 @@ def fit_jump_diffusion(series: np.ndarray) -> ModelParams:
     sigma_j = _safe_std(jump_sizes) if len(jump_sizes) > 1 else 0.0
 
     return ModelParams(
-        "jump_diffusion",
+        model_name,
         {"mu": mu, "sigma": sigma, "lambda": lam, "mu_j": mu_j, "sigma_j": sigma_j},
     )
 
@@ -181,15 +201,22 @@ def predict_jump_diffusion(last_value: float, params: Dict[str, float], horizon_
 def forecast_from_2016(
     last_value: float,
     rw_params: Dict[str, float],
-    jump_params: Dict[str, float],
+    jump_sym_params: Dict[str, float],
+    jump_asym_params: Dict[str, float],
     mr_params: Dict[str, float],
     target_year: int,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float]:
     horizon = target_year - 2016
     pred_rw = predict_random_walk(last_value, rw_params, horizon)
-    pred_jump = predict_jump_diffusion(last_value, jump_params, horizon)
+    pred_jump_sym = predict_jump_diffusion(last_value, jump_sym_params, horizon)
+    pred_jump_asym = predict_jump_diffusion(last_value, jump_asym_params, horizon)
     pred_mr = predict_mean_reversion(last_value, mr_params, horizon)
-    return max(pred_rw, 0.0), max(pred_jump, 0.0), max(pred_mr, 0.0)
+    return (
+        max(pred_rw, 0.0),
+        max(pred_jump_sym, 0.0),
+        max(pred_jump_asym, 0.0),
+        max(pred_mr, 0.0),
+    )
 
 
 # ========== Main workflow ==========
@@ -212,11 +239,19 @@ def run_analysis(
             train_values = train.loc[sorted(train.index)].to_numpy(dtype=float)
             last_value = float(train.loc[2016])
 
+            # Estimate all model parameters
             rw = fit_random_walk(train_values)
-            jump = fit_jump_diffusion(train_values)
+            jump_sym = fit_jump_diffusion(train_values, mode="symmetric")
+            jump_asym = fit_jump_diffusion(train_values, mode="asymmetric")
             mr = fit_mean_reversion(train_values)
 
-            for model, params in [(rw, rw.params), (jump, jump.params), (mr, mr.params)]:
+            # Save parameter records
+            for model, params in [
+                (rw, rw.params),
+                (jump_sym, jump_sym.params),
+                (jump_asym, jump_asym.params),
+                (mr, mr.params),
+            ]:
                 rec = {
                     "household_id": hh_id,
                     "consumption_type": col,
@@ -225,16 +260,25 @@ def run_analysis(
                 rec.update(params)
                 param_records.append(rec)
 
+            # Generate predictions
             for test_year in TEST_YEARS:
                 if test_year not in hh_df.index or pd.isna(hh_df.loc[test_year, col]):
                     continue
 
                 actual = float(hh_df.loc[test_year, col])
-                pred_rw, pred_jump, pred_mr = forecast_from_2016(
-                    last_value, rw.params, jump.params, mr.params, test_year
+                pred_rw, pred_jump_sym, pred_jump_asym, pred_mr = forecast_from_2016(
+                    last_value,
+                    rw.params,
+                    jump_sym.params,
+                    jump_asym.params,
+                    mr.params,
+                    test_year,
                 )
                 forecast_records.append(
-                    ForecastResult(hh_id, col, test_year, actual, pred_rw, pred_jump, pred_mr)
+                    ForecastResult(
+                        hh_id, col, test_year, actual,
+                        pred_rw, pred_jump_sym, pred_jump_asym, pred_mr,
+                    )
                 )
 
     params_df = pd.DataFrame(param_records)
@@ -243,9 +287,10 @@ def run_analysis(
     if forecast_df.empty:
         raise ValueError("No forecast samples available for evaluation; check missing data.")
 
-    # Per-model errors
+    # Compute prediction errors for each model
     forecast_df["err_rw"] = forecast_df["actual"] - forecast_df["pred_rw"]
-    forecast_df["err_jump"] = forecast_df["actual"] - forecast_df["pred_jump"]
+    forecast_df["err_jump_sym"] = forecast_df["actual"] - forecast_df["pred_jump_sym"]
+    forecast_df["err_jump_asym"] = forecast_df["actual"] - forecast_df["pred_jump_asym"]
     forecast_df["err_mr"] = forecast_df["actual"] - forecast_df["pred_mr"]
 
     def rmse(errors: pd.Series) -> float:
@@ -253,7 +298,8 @@ def run_analysis(
 
     rmse_values = {
         "random_walk": rmse(forecast_df["err_rw"]),
-        "jump_diffusion": rmse(forecast_df["err_jump"]),
+        "jump_diffusion_symmetric": rmse(forecast_df["err_jump_sym"]),
+        "jump_diffusion_asymmetric": rmse(forecast_df["err_jump_asym"]),
         "mean_reversion": rmse(forecast_df["err_mr"]),
     }
     rmse_series = pd.Series(rmse_values, name="total_rmse")
@@ -275,7 +321,8 @@ def print_report(
 
     model_labels = {
         "random_walk": "Random Walk",
-        "jump_diffusion": "Jump Diffusion",
+        "jump_diffusion_symmetric": "Jump Diffusion (Symmetric, 2σ)",
+        "jump_diffusion_asymmetric": "Jump Diffusion (Asymmetric Positive, 1σ)",
         "mean_reversion": "Mean Reversion",
     }
 
@@ -287,8 +334,8 @@ def print_report(
     print(f"Forecast samples (household x year): {n_obs}")
     print()
     print("Total RMSE by model (lower is better):")
-    for model in ["random_walk", "jump_diffusion", "mean_reversion"]:
-        print(f"  {model_labels[model]:16s} ({model}): {rmse[model]:,.2f}")
+    for model in ["random_walk", "jump_diffusion_symmetric", "jump_diffusion_asymmetric", "mean_reversion"]:
+        print(f"  {model_labels[model]:40s} ({model}): {rmse[model]:,.2f}")
 
     best = rmse.idxmin()
     print()
@@ -302,7 +349,7 @@ def save_results(
     rmse_df: pd.DataFrame,
     suffix: str,
 ) -> None:
-    """Save analysis outputs with a filename suffix (e.g. med, eec, combined)."""
+    """Save analysis outputs with a filename suffix (e.g., med, eec, combined)."""
     params_df.to_csv(
         OUTPUT_DIR / f"model_parameters_{suffix}.csv", index=False, encoding="utf-8-sig"
     )
